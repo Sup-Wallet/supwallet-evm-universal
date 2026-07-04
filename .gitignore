@@ -1,0 +1,6 @@
+# This is a docs-only showcase repo — no source, no secrets.
+.env
+.env.*
+.keystore/
+node_modules/
+.DS_Store
