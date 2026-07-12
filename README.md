@@ -62,7 +62,8 @@ flowchart TB
     end
 
     UA -- "cross-chain deposit (Universal Account transfer)" --> V
-    AGENT["Agent 'Sup' (backend signer)"] -- "vault.execute(adaptor, amountIn, expect, data)<br/>0 user signatures" --> V
+    AGENT["Agent 'Sup'"] -- "cross-chain pay / universal tx via UA<br/>(sources liquidity across chains, 0 user sigs)" --> UA
+    AGENT -- "vault.execute(adaptor, amountIn, expect, data)<br/>0 user signatures" --> V
     V -- "check registry-approved + owner-granted" --> REG
     V -- "send EXACTLY amountIn" --> AD
     AD -- "act on protocol" --> PROT
@@ -70,11 +71,36 @@ flowchart TB
     AD -- "credit ALL results back to vault (or revert)" --> V
 ```
 
-**Two paths, by design:**
-- **Cross‑chain** (bringing value in, or a universal payment) → Particle’s Universal Account flow, which sources liquidity across chains.
-- **Autonomous agent action** → `vault.execute(...)` on Arbitrum, signed by the agent, gated by the vault’s on‑chain allowlist + allowance + atomic post‑conditions.
+**Two surfaces, by design — and they compose:**
+- **Particle Universal Account (EIP‑7702) — cross‑chain reach.** One address, one balance. The agent moves value *across chains* here: a cross‑chain transfer (recipient gets the asset on any destination chain, sourced cross‑chain) or a **universal transaction** (an arbitrary contract call on any chain), signed by Sup’s app‑owned hot UA — **0 user signatures**.
+- **SupVault (Arbitrum) — trust‑minimized DeFi custody.** Strategy funds live here; the agent acts only through `vault.execute(...)`, gated on‑chain by the allowlist + allowance + atomic post‑conditions.
+
+The UA is the chain‑abstraction layer that gets value *to* the vault and lets the agent pay *out* anywhere; the vault is what makes the agent’s DeFi autonomy safe.
 
 See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the full design, flows, and trust model.
+
+---
+
+## Universal Accounts — one address, cross‑chain, agent‑operable
+
+Particle **Universal Accounts** in **EIP‑7702 mode** are the chain‑abstraction core — this is what the agent uses to act across chains without the user ever bridging or picking a chain.
+
+- **EIP‑7702, in place.** The user’s embedded EOA is upgraded to a Universal Account with `useEIP7702: true` — **same address**, one unified balance, no new account, no contract to deploy for the wallet itself.
+- **Cross‑chain transfer** (`createTransferTransaction`). “Send 20 USDC to `0x…` on Base” resolves the token on the **destination chain** and Particle sources the liquidity cross‑chain to deliver it there — the user never bridges. Used both for funding the vault and for the agent paying out on any chain.
+- **Universal transaction** (`createUniversalTransaction` + `expectTokens`). The agent can execute an **arbitrary contract call on any chain** — not just transfers — with the required tokens sourced cross‑chain, all in one Universal Account operation.
+- **Autonomous, 0‑sig.** These run through Sup’s **app‑owned hot UA**: the backend owner‑signs the opaque rootHash after a semantic verifier gates the transaction, so the user signs nothing while every action stays within policy.
+
+```mermaid
+sequenceDiagram
+    participant Agent as Agent 'Sup'
+    participant UA as Particle Universal Account (7702)
+    participant Src as Source chain(s)
+    participant Dst as Destination chain
+    Agent->>UA: createTransferTransaction / createUniversalTransaction
+    UA->>Src: source liquidity across chains
+    UA->>Dst: deliver / execute on the destination chain
+    Dst-->>Agent: settled (tx hash) — 0 user signatures
+```
 
 ---
 
@@ -118,8 +144,9 @@ Adaptors are small (~30–50 line) contracts that teach the agent one protocol b
 
 | Hard requirement | How SupWallet meets it |
 |---|---|
-| **Uses EIP‑7702 mode** | The user’s embedded EOA is upgraded in place to a Particle Universal Account (`smartAccountOptions.useEIP7702`), same address. |
-| **≥ 1 cross‑chain value transfer via UA** | “Fund / top up” pulls USDC from another chain into the Arbitrum account via a Universal Account transfer. |
+| **Uses EIP‑7702 mode** | The embedded EOA is upgraded in place to a Particle Universal Account created with `useEIP7702: true` (`name: "UNIVERSAL"`) — same address, no new account. |
+| **≥ 1 cross‑chain value transfer via UA** | Both funding and agent payouts use `createTransferTransaction` with a `destinationChainId`: the token is resolved on the destination chain and Particle sources it cross‑chain to deliver there — e.g. “send ETH to Ethereum mainnet” settles on L1, not Arbitrum. |
+| **Beyond transfers** | `createUniversalTransaction` + `expectTokens` lets the agent run an arbitrary contract call on any chain, tokens sourced cross‑chain — one Universal Account operation. |
 | **Runnable demo** | Hosted live app + walkthrough video (links above). |
 
 ---

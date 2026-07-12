@@ -20,10 +20,23 @@ This document covers the accounts, the flows, the trust boundaries, and the desi
 
 ---
 
-## The two spending paths
+## The two surfaces
 
-1. **Cross‑chain (Universal Account transfer).** Bringing value in, or paying across chains, goes through Particle’s Universal Account flow, which sources liquidity across chains and settles to the destination. Signed by the user. This is how the vault gets funded from any chain.
-2. **Autonomous agent action (`vault.execute`).** The agent’s day‑to‑day work — swaps, payments, strategy steps — is a call to `vault.execute(adaptor, inputToken, amountIn, expect, callData)` on Arbitrum, signed by the agent’s key and gated entirely by the vault’s on‑chain checks.
+SupWallet composes two things: Particle Universal Accounts give **cross‑chain reach**; the SupVault gives **trust‑minimized DeFi custody**.
+
+### A · Particle Universal Account (EIP‑7702) — cross‑chain execution
+
+The user’s EOA, upgraded in place (`useEIP7702: true`, `name: "UNIVERSAL"`). One address, one balance across chains. It is the funding ramp **and** an active agent capability:
+
+- **Cross‑chain transfer** — `createTransferTransaction` with a `destinationChainId`. The token is resolved on the *destination* chain and Particle sources the liquidity cross‑chain, so “send USDC to Base” or “send ETH to Ethereum L1” delivers on that chain — the user never bridges. Used for funding the vault and for agent payouts.
+- **Universal transaction** — `createUniversalTransaction` + `expectTokens`. An arbitrary contract call on any chain, with the tokens it needs sourced cross‑chain, in one Universal Account operation.
+- **Autonomous, 0‑sig.** For agent actions these run through Sup’s **app‑owned hot UA**: a semantic verifier gates the transaction, then the backend owner‑signs the opaque rootHash — the user signs nothing, and the agent stays within its spending policy.
+
+### B · Autonomous vault action (`vault.execute`)
+
+The agent’s DeFi work — swaps, strategy steps, capped payments — is a call to `vault.execute(adaptor, inputToken, amountIn, expect, callData)` on Arbitrum, signed by the agent’s key and gated entirely by the vault’s on‑chain checks (below). This is where custody safety is enforced.
+
+The UA gets value *to* the vault and lets the agent act *across chains*; the vault makes the agent’s on‑chain DeFi autonomy safe.
 
 ---
 
