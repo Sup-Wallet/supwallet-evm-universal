@@ -310,18 +310,48 @@ permission — execution still requires curation into `AdaptorRegistry` plus an 
 
 ---
 
-## 8. Particle UA cross-chain role
+## 8. Particle Universal Account — why it matters and how SupWallet uses it
 
-Particle UA remains important, but it is not the vault:
+The Universal Account is what makes the whole product approachable: it removes the parts of crypto that
+scare a normal user (seed phrases, gas, bridging, "which chain is my money on") *before* the agent ever
+does anything.
 
-- Same address / unified balance for the owner.
-- Cross-chain transfer via `createTransferTransaction(destinationChainId)`.
-- Arbitrary cross-chain contract call via `createUniversalTransaction`.
-- EIP-7702 batching lets a multi-step user action need a single signature.
-- Used as the funding and payout ramp around the Arbitrum vault.
+### 8.1 What Particle UA gives us
 
-Cross-chain work cannot give the same all-or-nothing invariant as an Arbitrum `executeBatch`, so the
-vault/adaptor safety model is intentionally single-chain.
+- **One address on every chain, upgraded in place (EIP-7702).** A social login mints a Privy embedded
+  EOA; EIP-7702 upgrades *that same address* into a Universal Account. There is no second "smart wallet"
+  address to teach users about — the EOA they see is the account that works everywhere.
+- **A single unified balance.** Particle aggregates the user's holdings across chains into one spendable
+  balance. The user thinks in dollars, not in "USDC on Base vs USDC on Arbitrum".
+- **Cross-chain sourcing with no bridge UI.** A payment or deposit can be *sourced* from whatever chain
+  the funds happen to sit on and *delivered* to Arbitrum, in one user action — no bridge selection, no
+  wrapped-asset juggling, no chain picker.
+- **One signature for multi-step actions (EIP-7702 batching).** Several userOps are covered by a single
+  `personal_sign` over the batch root hash, and the 7702 authorization is a one-time-per-chain step — so
+  "approve + deposit", or a multi-leg route, is one tap instead of several.
+- **No separate account to pre-fund.** Because the UA *is* the user's account, there is never an "agent
+  account" to top up on each chain — the classic funded-card UX problem simply doesn't exist here.
+
+### 8.2 How SupWallet applies it
+
+- **Onboarding.** Email/Google → Privy embedded EOA → EIP-7702 upgrade to a Particle UA. Same address,
+  usable immediately; the user never handles a key.
+- **Fund the vault from anywhere.** `createTransferTransaction(destinationChainId)` moves same-chain
+  balance and delivers cross-chain to Arbitrum; `createUniversalTransaction` (with `expectTokens`)
+  cross-*sources* from other chains for an arbitrary contract-call route. The deposit UX surfaces the
+  actual **source chain(s)** and blocks on a source-chain mismatch, so funds "respect their origin chain"
+  rather than silently moving balance the user didn't intend.
+- **Payout ramp.** The same primitives move value back out of Arbitrum to wherever the user wants it.
+- **Signature economy.** 7702 batching means a fund-and-deposit, or a route with several legs, asks the
+  user for exactly one signature.
+
+### 8.3 The deliberate boundary
+
+The UA is the **funding and payout ramp**, not the vault. Cross-chain execution cannot offer the same
+all-or-nothing invariant as an Arbitrum `executeBatch` (there is no single-transaction atomicity across
+chains), so the vault/adaptor safety model is intentionally **single-chain on Arbitrum**: UA brings value
+*to* the vault and takes it *out*, and every agent action that touches the principal happens inside the
+one chain where the post-conditions can be enforced atomically.
 
 ---
 
