@@ -12,7 +12,7 @@
 
 | | |
 |---|---|
-| 🎥 Demo video | _<!-- TODO: link -->_ |
+| 🎥 Demo video | **[▶ Watch the demo](https://drive.google.com/file/d/1WYVduXx2euUi0zeLb2q2at7DPfeKGN6f/view?usp=sharing)** |
 | 🌐 Live demo | _<!-- TODO: link -->_ |
 | 🔗 Cross‑chain UA funding tx | _<!-- TODO: Arbiscan link -->_ |
 | 🔗 Agent vault action (swap via adaptor) | _<!-- TODO: Arbiscan link -->_ |
