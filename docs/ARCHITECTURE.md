@@ -53,27 +53,17 @@ contracts tree as unused reference-only code.
 
 ## 3. System components
 
-```
-                         ┌─────────────────────────────────────────────┐
-  SURFACES               │  Web chat (AgentChat)   Telegram bot + /tg   │
-                         └───────────────┬─────────────────────────────┘
-                                         │  natural language
-                         ┌───────────────▼─────────────────────────────┐
-  BRAIN                  │  runAgentTurn · system prompts · tools       │
-                         └───────────────┬─────────────────────────────┘
-                                         │  typed action envelope
-                         ┌───────────────▼─────────────────────────────┐
-  MONEY-PATH FIREWALL    │  recipient provenance · intent weld ·        │
-                         │  preflight · receiver guard · failure guard  │
-                         └───────────────┬─────────────────────────────┘
-                                         │  bounded, verified action
-                         ┌───────────────▼─────────────────────────────┐
-  EXECUTION              │  SupVault.execute / executeBatch on Arbitrum │
-                         │  Particle UA funding / payout                │
-                         └───────────────┬─────────────────────────────┘
-                                         │
-  STATE                  │  grants · allowances · vaults · listings ·   │
-                         │  activity · strategy · optional memory       │
+```mermaid
+flowchart TB
+    S["<b>SURFACES</b><br/>Web chat (AgentChat) · Telegram bot + /tg"]
+    B["<b>BRAIN</b><br/>runAgentTurn · system prompts · tools"]
+    F["<b>MONEY-PATH FIREWALL</b><br/>recipient provenance · intent weld<br/>preflight · receiver guard · failure guard"]
+    E["<b>EXECUTION</b><br/>SupVault.execute / executeBatch on Arbitrum<br/>Particle UA funding / payout"]
+    ST["<b>STATE</b><br/>grants · allowances · vaults · listings<br/>activity · strategy · optional memory"]
+    S -->|natural language| B
+    B -->|typed action envelope| F
+    F -->|bounded, verified action| E
+    E --> ST
 ```
 
 ### Key modules and contracts
