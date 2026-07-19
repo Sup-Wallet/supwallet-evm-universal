@@ -4,6 +4,9 @@ An AI-agent wallet on **Arbitrum One**. Sup turns natural language into typed ac
 execution are bounded by the shipped onchain **SupVault + adaptor** model. Particle Universal Account
 (EIP-7702) is the cross-chain funding and payout ramp; the vault itself is Arbitrum-only.
 
+**Live:** app → https://supwallet-evm-universal.vercel.app · docs → https://supwallet-evm-universal.vercel.app/docs
+· public repo → https://github.com/Sup-Wallet/supwallet-evm-universal
+
 ---
 
 ## 1. The one-paragraph mental model
@@ -14,6 +17,10 @@ that pass two gates: the adaptor address is curated in `AdaptorRegistry`, and th
 adaptor a token allowance. The vault transfers **exactly** the authorized `amountIn`, calls the adaptor
 with `call` (never `delegatecall`), then checks that the adaptor overspent nothing, retained nothing,
 and returned the declared result to the vault. If any invariant fails, the transaction reverts.
+
+The result: the agent gets real autonomy — natural-language DeFi, cross-chain funding, multi-step
+strategies — while the principal is **structurally** unreachable to it. Custody safety is a property of
+the contract, not a promise about the backend or the model.
 
 ---
 
@@ -39,6 +46,7 @@ contracts tree as unused reference-only code.
 | `PayAdaptor` | `0x78c0a7bb3a666E83110cCFE275AE701BB684A2f5` | Payment adaptor |
 | `UniswapV3SwapAdaptor` | `0x5Ee5725481AF6276dDCBB03EB4767460D2C7a2Df` | Swap adaptor |
 | `AaveV3SupplyAdaptor` | `0x579f03527fcA38852a6caC47b947b30Db881021A` | Supply-to-Aave adaptor |
+| `AaveV3WithdrawAdaptor` | `0x32cC0133063C613A21C2246c208C43710f90c637` | Redeem-from-Aave adaptor |
 | `AdaptorListingRegistry` | `0xedCF749749a13BC00902C057055F2207bBdAbCf8` | Open marketplace listings |
 
 ---
@@ -71,7 +79,7 @@ contracts tree as unused reference-only code.
 ### Key modules and contracts
 
 - **Vault contracts**: `SupVaultFactory`, `SupVault`, `AdaptorRegistry`, `AdaptorListingRegistry`,
-  `IAdaptor`, `PayAdaptor`, `UniswapV3SwapAdaptor`.
+  `IAdaptor`, `PayAdaptor`, `UniswapV3SwapAdaptor`, `AaveV3SupplyAdaptor`, `AaveV3WithdrawAdaptor`.
 - **Vault UI**: deposit/withdraw supports USDC, WETH, and native ETH. ETH deposits wrap to WETH; WETH
   withdrawals can unwrap to native ETH.
 - **Particle UA**: `createTransferTransaction` handles cross-chain transfer with
@@ -87,82 +95,229 @@ Optional, off by default:
 
 ---
 
-## 4. SupVault execution invariants
+## 4. SupVault: execution invariants and why the flow is safe
 
-### `execute(...)`
+### 4.1 The vault data model
 
-`execute(adaptor, inputToken, amountIn, Expectation, callData)`:
+A vault is an **EIP-1167 minimal-proxy clone** per user; `initialize(owner, agent, registry)` sets the
+owner once. It stores one `Allowance` per `(adaptor, token)` pair:
 
-1. Requires the adaptor to be curated in `AdaptorRegistry`.
-2. Requires the owner to have granted that adaptor for the input token.
-3. Debits the per-`(adaptor, token)` allowance: `perTxCap`, `periodCap` rolling window, and `expiry`.
-4. Transfers **exactly** `amountIn` to the adaptor.
-5. Calls the adaptor with normal `call`, never `delegatecall`.
-6. Verifies post-conditions: no over-spend, adaptor kept no residual input token, and the declared
-   result credited to the vault by at least `minOut`.
+```solidity
+struct Allowance {
+    uint256 perTxCap;      // max per single execute (token base units)
+    uint256 periodCap;     // max total per rolling window
+    uint256 periodLength;  // window length (seconds)
+    uint256 validUntil;    // hard expiry (unix seconds)
+    uint256 windowStart;   // rolling-window bookkeeping
+    uint256 spentInWindow;
+    bool    granted;       // owner opted this (adaptor, token) in
+}
+```
 
-The blast radius of a malicious approved adaptor is one authorized `amountIn`, not the vault balance.
+The caller also declares what the vault should *receive* so the vault can verify results generically:
 
-### `executeBatch(...)`
+```solidity
+enum AssetKind { ERC20, ERC721, NONE }
+struct Expectation { address asset; uint256 minOut; AssetKind kind; }
+```
 
-`executeBatch(Call[])` is the EVM analogue of a Sui PTB: several adaptor calls run in one atomic
-transaction. Each step keeps the same checks as `execute`, and every step's outputs are forced back to
-the vault before the next step starts. That lets a later step consume an earlier step's output, while any
-mid-batch revert rolls back the whole batch.
+`kind = ERC20` → the vault's balance of `asset` must rise by `≥ minOut`; `ERC721` → the vault must own
+`≥ minOut` more NFTs; `NONE` → a pure outflow (e.g. a payment) that credits nothing back, so the result
+check is skipped — but the over-spend and adaptor-kept-nothing invariants below still apply.
 
-Foundry coverage includes chained steps, mid-batch rollback, per-step allowance debit, and `onlyAgent`.
+### 4.2 `execute(...)` — the runtime "hot potato"
+
+`execute(adaptor, inputToken, amountIn, Expectation, callData)` runs, in one atomic transaction:
+
+1. **Registry gate** — `registry.isApproved(adaptor)` or revert `AdaptorNotApproved`.
+2. **Debit the allowance** (`_debit`): revert `AdaptorNotGranted` if the owner never opted in, `Expired`
+   past `validUntil`, `OverPerTxCap` if `amountIn > perTxCap`, `OverPeriodCap` if the rolling window
+   would be exceeded (the window resets after `periodLength`).
+3. **Hand over EXACTLY `amountIn`** — `safeTransfer(adaptor, amountIn)`. A transfer, not an open
+   approval, so even a malicious approved adaptor can pull at most this one call's `amountIn`.
+4. **Call the adaptor with `call`, never `delegatecall`** — the adaptor runs in its own storage and can
+   never touch the vault's `owner` or `allowances`.
+5. **Post-conditions** — any violation reverts the whole transaction:
+
+   | Check | Error | What it prevents |
+   |---|---|---|
+   | no more than `amountIn` left the vault | `OverSpend` | the adaptor pulling more than the one authorized amount |
+   | `balanceOf(adaptor) == 0` for `inputToken` after | `AdaptorRetainedFunds` | the adaptor skimming or parking funds |
+   | result asset up by `≥ minOut` (unless `kind = NONE`) | `ResultNotCredited` | swap/supply output going anywhere but the vault |
+
+**Blast radius.** The agent chooses neither the recipient nor any retained funds; it only triggers an
+owner-authorized adaptor within owner-set caps. An attacker holding the agent key can lose at most one
+`perTxCap` of one granted `(adaptor, token)` — and for a swap/supply that value still lands **back in
+the owner's vault**. Only a `NONE`-kind adaptor (a payment) is a true outflow, and it is still bounded to
+one `amountIn`. The rest of the vault is unreachable.
+
+### 4.3 `executeBatch(...)` — atomic multi-step (the EVM analog of a Sui PTB)
+
+`executeBatch(Call[])` runs several adaptor calls in one transaction. Because every step forces its
+result back into the vault before the next begins, a later step can **consume an earlier step's output**:
+
+```
+executeBatch([
+  { swap  USDC → WETH  via UniswapV3SwapAdaptor, expect WETH ≥ minOut },
+  { supply WETH → Aave via AaveV3SupplyAdaptor,  expect aWETH ≥ minOut },
+])
+```
+
+Each step keeps the full per-step invariants from 4.2. If the Aave step reverts, the swap rolls back
+too — the strategy is **all-or-nothing** and never lands half-done. A single `nonReentrant` guard wraps
+the whole batch. Foundry coverage includes chained steps, mid-batch rollback, per-step allowance debit,
+and `onlyAgent`.
+
+### 4.4 What is trustless vs trusted here
+
+- **Trustless (enforced by the contract):** owner-only deposit/withdraw, the registry check, the owner
+  grant, the per-`(adaptor, token)` caps/expiry, "exactly `amountIn` leaves per call", "no
+  `delegatecall`", "adaptor keeps nothing", and "the declared result lands in the vault".
+- **Trusted but bounded to one `amountIn`/call:** the audited adaptor code and the curated registry.
 
 ---
 
-## 5. Shipped adaptors
+## 5. Adaptor construction
 
-Only two EVM adaptors exist today:
+An adaptor is the **only** thing the agent can point the vault at, so its shape is deliberately narrow.
+
+### 5.1 The `IAdaptor` contract
+
+```solidity
+interface IAdaptor {
+    // The vault has already sent EXACTLY `amountIn` of `inputToken` before this call.
+    // Interact with ONE protocol; credit ALL results to `vault`; keep nothing.
+    function execute(address inputToken, uint256 amountIn, address vault, bytes calldata callData) external;
+
+    // The single protocol contract this adaptor is allowed to touch (informational, for inspection).
+    function protocol() external view returns (address);
+}
+```
+
+An adaptor is a **fixed, audited, stateless pass-through** to exactly one protocol. It is the EVM analog
+of a Sup Sui adaptor: the vault's runtime post-conditions play the role of the Move *hot-potato* (results
+forced back in-tx), and the curated registry plays the role of the unforgeable *witness type*.
+
+### 5.2 Rules every adaptor must satisfy
+
+The vault re-checks these at runtime, so a violation reverts the whole transaction — but a correct
+adaptor is written to honor them by construction:
+
+1. **Hold no funds across calls.** The vault sends `amountIn` immediately before `execute`; the adaptor
+   consumes it and ends the call holding zero `inputToken` (`AdaptorRetainedFunds` otherwise).
+2. **Credit all results to `vault`.** Set `recipient` / `onBehalfOf = vault` on the wrapped protocol
+   call. Swapped tokens, LP/receipt tokens, and position NFTs all land in the vault, never in the adaptor
+   or the agent.
+3. **Never overspend** — use at most `amountIn` (`OverSpend` otherwise).
+4. **`callData` is decoded parameters, never an arbitrary call target.** Pool tiers, `minOut`, tick
+   ranges are decoded by the adaptor; an arbitrary target would defeat the allowlist.
+5. **Exact, self-zeroing approvals.** Approve the protocol for exactly `amountIn` and reset to `0` after,
+   so no standing allowance outlives the call.
+
+### 5.3 Worked example — `UniswapV3SwapAdaptor`
+
+```solidity
+function execute(address inputToken, uint256 amountIn, address vault, bytes calldata callData) external {
+    (address tokenOut, uint24 fee, uint256 minOut) = abi.decode(callData, (address, uint24, uint256));
+
+    IERC20(inputToken).forceApprove(address(router), amountIn);   // exact approval
+    router.exactInputSingle(ISwapRouter02.ExactInputSingleParams({
+        tokenIn: inputToken, tokenOut: tokenOut, fee: fee,
+        recipient: vault,                 // result lands in the VAULT, never here, never the agent
+        amountIn: amountIn,
+        amountOutMinimum: minOut,         // slippage floor at the router …
+        sqrtPriceLimitX96: 0
+    }));
+    IERC20(inputToken).forceApprove(address(router), 0);          // no standing allowance survives
+}
+```
+
+Slippage is enforced **twice** — `amountOutMinimum` at the router *and* the vault's own `expect.minOut`
+post-condition. The immutable `router` address is the one protocol this adaptor may touch.
+
+### 5.4 Two independent gates before an adaptor can ever run
+
+1. **Curation** — the adaptor address must be `isApproved` in `AdaptorRegistry` (a curator-controlled,
+   protocol-level allowlist).
+2. **Owner grant** — the vault owner must `setAllowance(adaptor, token, perTxCap, periodCap,
+   periodLength, validUntil)`.
+
+Both are required; neither alone is enough. Publishing to the marketplace (`AdaptorListingRegistry`) is
+discovery metadata only and grants nothing.
+
+### 5.5 AI-authored adaptors
+
+`/api/adaptors/author` drafts an `IAdaptor` implementation from a natural-language protocol description,
+pre-bound to the invariants in 5.2. **Drafting or publishing never grants execution rights** — a human
+still curates the contract into `AdaptorRegistry`, and the owner still grants the allowance in their
+vault. The AI shortens authoring; it does not shortcut the trust gates.
+
+---
+
+## 6. Shipped adaptors
 
 | Adaptor | Purpose | Result expectation |
 |---|---|---|
-| `PayAdaptor` | Pay a recipient from the vault | `AssetKind.NONE` |
-| `UniswapV3SwapAdaptor` | Swap through Uniswap V3 | Output token credited to vault, `minOut` enforced |
+| `PayAdaptor` | Pay a recipient from the vault | `AssetKind.NONE` (bounded outflow) |
+| `UniswapV3SwapAdaptor` | Swap through Uniswap V3 | output token credited to vault, `minOut` enforced |
+| `AaveV3SupplyAdaptor` | Supply to Aave V3 | `aToken` credited to vault, `minOut` enforced |
+| `AaveV3WithdrawAdaptor` | Redeem vault `aToken` back to the underlying | underlying credited to vault, `minOut` enforced |
 
-Uniswap LP, lending, perps, and other protocol adaptors are planned marketplace additions,
-not shipped contracts.
+Uniswap LP, perps, and other protocol adaptors are planned marketplace additions, not shipped contracts.
 
 ---
 
-## 6. UX flows
+## 7. UX flows
 
 ### A. Fund the vault
 
-1. User chooses USDC, WETH, or native ETH.
-2. Same-chain deposits transfer into the user's vault. Native ETH is wrapped to WETH on deposit.
-3. Cross-chain funding uses Particle UA to source funds from another chain and deliver value to
-   Arbitrum, then completes the vault deposit flow.
+1. **Sign in** with email/Google (Privy embedded EOA), upgraded in place via EIP-7702 into a Particle
+   Universal Account — same address, one balance across chains.
+2. **Pick asset + amount** (USDC / WETH / native ETH). Native ETH is wrapped to WETH on deposit.
+3. **Same-chain:** `vault.deposit(token, amount)` pulls from the UA — one signature.
+4. **Cross-chain:** if the USDC is on another chain, Particle UA sources it
+   (`createTransferTransaction(destinationChainId)`, or `createUniversalTransaction` for a contract-call
+   route) and delivers value to Arbitrum, then the deposit completes. The UI shows the source chain(s)
+   and **blocks on a source-chain mismatch** — funds respect their origin chain.
 
-### B. Agent executes through an adaptor
+### B. Authorize an adaptor (grant)
 
-1. Owner grants an adaptor/token allowance with per-tx cap, period cap, and expiry.
-2. Sup prepares an adaptor call from user intent.
-3. The vault executes it only if registry, owner grant, allowance, and post-conditions all pass.
-4. Results stay in the vault.
+- The first time Sup needs an adaptor, an **inline grant card** appears in chat — contextual, not an
+  onboarding ceremony.
+- The owner sets caps (`perTxCap`, `periodCap` over a `periodLength` window, `validUntil`); one signature
+  calls `setAllowance(...)`.
+- **Revoke anytime:** `revokeAllowance(adaptor, token)` flips `granted = false` instantly. Funds never
+  left the vault, so there is nothing to unwind.
 
-### C. Withdraw
+### C. Agent executes through an adaptor — 0 owner signatures
 
-Only the owner can withdraw. USDC/WETH withdrawals transfer from the vault; WETH can be unwrapped to
-native ETH on withdrawal.
+1. Natural language → typed action envelope.
+2. **Money-path firewall:** recipient provenance, intent weld, preflight, receiver guard, failure guard.
+3. `SupVault.execute` / `executeBatch` runs only if registry + grant + allowance + post-conditions all
+   pass. The agent server wallet sends the tx and pays gas; the owner signs nothing.
+4. A policy failure reverts and surfaces as a **"blocked"** card — a feature, not an error. Results stay
+   in the vault.
 
-### D. Marketplace
+### D. Withdraw
 
-Anyone can publish adaptor discovery metadata to `AdaptorListingRegistry`. That is not executable
-permission. Execution requires curation into `AdaptorRegistry` plus an owner grant in the vault.
+Owner-only. USDC/WETH transfer from the vault; WETH can be unwrapped to native ETH on withdrawal. The
+agent can never withdraw or move a position out — it can only *operate* positions via `execute`.
+
+### E. Marketplace
+
+Anyone can publish adaptor discovery metadata to `AdaptorListingRegistry`. That is **not** executable
+permission — execution still requires curation into `AdaptorRegistry` plus an owner grant.
 
 ---
 
-## 7. Particle UA cross-chain role
+## 8. Particle UA cross-chain role
 
 Particle UA remains important, but it is not the vault:
 
 - Same address / unified balance for the owner.
 - Cross-chain transfer via `createTransferTransaction(destinationChainId)`.
 - Arbitrary cross-chain contract call via `createUniversalTransaction`.
+- EIP-7702 batching lets a multi-step user action need a single signature.
 - Used as the funding and payout ramp around the Arbitrum vault.
 
 Cross-chain work cannot give the same all-or-nothing invariant as an Arbitrum `executeBatch`, so the
@@ -170,7 +325,7 @@ vault/adaptor safety model is intentionally single-chain.
 
 ---
 
-## 8. Trust boundaries
+## 9. Trust boundaries
 
 - **Onchain enforced:** vault custody, owner-only deposit/withdraw, curated registry check, owner grant,
   per-`(adaptor, token)` allowance, exact `amountIn`, no `delegatecall`, adaptor residual check, and
@@ -183,12 +338,14 @@ vault/adaptor safety model is intentionally single-chain.
 
 ---
 
-## 9. Status
+## 10. Status
 
 - **Deployed on Arbitrum One:** factory, vault implementation, curated registry, listing registry,
-  `PayAdaptor`, `UniswapV3SwapAdaptor`.
+  `PayAdaptor`, `UniswapV3SwapAdaptor`, `AaveV3SupplyAdaptor`, `AaveV3WithdrawAdaptor`.
 - **Built/tested:** `execute`, `executeBatch`, chained batch steps, mid-batch rollback, per-step
-  allowance, and `onlyAgent`.
-- **UI shipped:** vault deposit/withdraw for USDC/WETH/native ETH and Particle UA cross-chain funding.
-- **Planned:** Uniswap LP, lending/perps adaptors, expanded marketplace analytics and
-  review flows.
+  allowance, and `onlyAgent`; Aave supply/withdraw exercised against a mainnet fork.
+- **UI shipped:** vault deposit/withdraw for USDC/WETH/native ETH, Particle UA cross-chain funding, and
+  autonomous agent execution (swap + Aave supply/withdraw) end-to-end with real USDC.
+- **Planned:** Uniswap LP, perps adaptors, expanded marketplace analytics and review flows.
+</content>
+</invoke>

@@ -13,7 +13,7 @@
 | | |
 |---|---|
 | 🎥 Demo video | **[▶ Watch the demo](https://drive.google.com/file/d/1WYVduXx2euUi0zeLb2q2at7DPfeKGN6f/view?usp=sharing)** |
-| 🌐 Live demo | _<!-- TODO: link -->_ |
+| 🌐 Live demo | **[supwallet-evm-universal.vercel.app](https://supwallet-evm-universal.vercel.app)** · [in-app docs](https://supwallet-evm-universal.vercel.app/docs) |
 | 🔗 Cross‑chain UA funding tx | _<!-- TODO: Arbiscan link -->_ |
 | 🔗 Agent vault action (swap via adaptor) | _<!-- TODO: Arbiscan link -->_ |
 | 📜 Deployed contracts | [see below](#-deployed-on-arbitrum-one) |
