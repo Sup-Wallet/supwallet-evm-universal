@@ -1,173 +1,194 @@
-# Architecture
+# SupWallet (EVM) — Architecture, System Design, UX
 
-SupWallet is a **chain‑agnostic, self‑custodial agent wallet**. The user funds one address — their EOA upgraded to a Particle **Universal Account** via **EIP‑7702** — and their strategy assets live in an on‑chain **SupVault** that an AI agent can *operate* through allowlisted adaptors but can never *drain*. The safety is enforced by the vault contract, not trusted to a backend.
-
-This document covers the accounts, the flows, the trust boundaries, and the design decisions behind the architecture.
+An AI-agent wallet on **Arbitrum One**. Sup turns natural language into typed actions, but custody and
+execution are bounded by the shipped onchain **SupVault + adaptor** model. Particle Universal Account
+(EIP-7702) is the cross-chain funding and payout ramp; the vault itself is Arbitrum-only.
 
 ---
 
-## Accounts & contracts
+## 1. The one-paragraph mental model
 
-| Component | Role | Custody |
+Each owner has an isolated `SupVault` clone. The owner is the only party that can deposit or withdraw.
+The agent can only call `execute(...)` or `executeBatch(...)` on that vault, and only through adaptors
+that pass two gates: the adaptor address is curated in `AdaptorRegistry`, and the owner has granted that
+adaptor a token allowance. The vault transfers **exactly** the authorized `amountIn`, calls the adaptor
+with `call` (never `delegatecall`), then checks that the adaptor overspent nothing, retained nothing,
+and returned the declared result to the vault. If any invariant fails, the transaction reverts.
+
+---
+
+## 2. Current custody model
+
+| Rail | What it's for | Where funds live | Hard bound | Signature shape |
+|---|---|---|---|---|
+| **SupVault** | Agent payments and swaps through approved adaptors | Per-owner vault clone on Arbitrum | Per-`(adaptor, token)` cap + runtime post-conditions | Owner grants once; agent runs within caps |
+| **Particle UA** | Cross-chain funding into the vault and payout from Arbitrum | User's UA / same EOA address | User-signed UA transaction + Particle route checks | User signs cross-chain actions |
+| **Optional private float** | Private autonomous strategy research | Separate shielded float | Float size | Planned / advanced only |
+
+Retired: the `AllowanceRouter` ERC-20 approve rail, Privy TEE policy / scoped signer /
+`SessionPolicy`, ZeroDev, and "Tier-1 allowance card" language. `AllowanceRouter.sol` remains in the
+contracts tree as unused reference-only code.
+
+### Live Arbitrum One deployments
+
+| Contract | Address | Role |
 |---|---|---|
-| **Privy embedded wallet** | The user’s key, created on social login. Private key lives in Privy’s secure enclave (TEE). | User |
-| **Particle Universal Account** | The same EOA, upgraded **in place via EIP‑7702** — same address, unified balance across chains. The funding ramp. | User (it *is* the user’s address) |
-| **SupVault** | A per‑owner minimal‑proxy (EIP‑1167) clone that custodies the user’s strategy assets. Owner‑only deposit/withdraw. | User (owner‑only withdraw) |
-| **Adaptors** | Small, audited, stateless contracts that wrap one protocol behind a typed, capped interface (Uniswap swap, pay, …). | Hold nothing across calls |
-| **AdaptorRegistry** | The curated allowlist. A vault refuses to `execute` any adaptor not approved here — a kill switch for a bad adaptor. | Curator |
-| **AdaptorListingRegistry** | The open, permissionless marketplace board. Anyone can list an adaptor for discovery; listing grants no execution rights. | Permissionless |
-| **Agent “Sup” signer** | A backend‑controlled key set as the vault’s on‑chain `agent` delegate. It can only call `vault.execute(...)`, bounded on‑chain. | Backend (bounded — never owns funds) |
+| `SupVaultFactory` | `0x7d75152E46048941E9B3a1e463f122B621833136` | EIP-1167 per-owner vault clones |
+| `SupVault` implementation | `0xd9BeFB8160b1D10d6252Ba8c184D5e94584dbf38` | Vault logic |
+| `AdaptorRegistry` | `0x741E7C55689c1B2B615ddB1520bA485B4Fb332d9` | Curated execution allowlist |
+| `PayAdaptor` | `0x78c0a7bb3a666E83110cCFE275AE701BB684A2f5` | Payment adaptor |
+| `UniswapV3SwapAdaptor` | `0x5Ee5725481AF6276dDCBB03EB4767460D2C7a2Df` | Swap adaptor |
+| `AaveV3SupplyAdaptor` | `0x579f03527fcA38852a6caC47b947b30Db881021A` | Supply-to-Aave adaptor |
+| `AdaptorListingRegistry` | `0xedCF749749a13BC00902C057055F2207bBdAbCf8` | Open marketplace listings |
 
 ---
 
-## The two surfaces
+## 3. System components
 
-SupWallet composes two things: Particle Universal Accounts give **cross‑chain reach**; the SupVault gives **trust‑minimized DeFi custody**.
-
-### A · Particle Universal Account (EIP‑7702) — cross‑chain execution
-
-The user’s EOA, upgraded in place (`useEIP7702: true`, `name: "UNIVERSAL"`). One address, one balance across chains. It is the funding ramp **and** an active agent capability:
-
-- **Cross‑chain transfer** — `createTransferTransaction` with a `destinationChainId`. The token is resolved on the *destination* chain and Particle sources the liquidity cross‑chain, so “send USDC to Base” or “send ETH to Ethereum L1” delivers on that chain — the user never bridges. Used for funding the vault and for agent payouts.
-- **Universal transaction** — `createUniversalTransaction` + `expectTokens`. An arbitrary contract call on any chain, with the tokens it needs sourced cross‑chain, in one Universal Account operation.
-- **Autonomous, 0‑sig.** For agent actions these run through Sup’s **app‑owned hot UA**: a semantic verifier gates the transaction, then the backend owner‑signs the opaque rootHash — the user signs nothing, and the agent stays within its spending policy.
-
-### B · Autonomous vault action (`vault.execute`)
-
-The agent’s DeFi work — swaps, strategy steps, capped payments — is a call to `vault.execute(adaptor, inputToken, amountIn, expect, callData)` on Arbitrum, signed by the agent’s key and gated entirely by the vault’s on‑chain checks (below). This is where custody safety is enforced.
-
-The UA gets value *to* the vault and lets the agent act *across chains*; the vault makes the agent’s on‑chain DeFi autonomy safe.
-
----
-
-## The vault `execute` flow — where safety is enforced
-
-```mermaid
-flowchart TB
-    A["Agent calls vault.execute(adaptor, inputToken, amountIn, expect, data)"]
-    A --> C1{"registry.isApproved(adaptor)?"}
-    C1 -- no --> R1["revert"]
-    C1 -- yes --> C2{"owner granted allowance?<br/>within per-tx / rolling cap / expiry?"}
-    C2 -- no --> R2["revert"]
-    C2 -- yes --> D["debit allowance · snapshot balances"]
-    D --> T["transfer EXACTLY amountIn to adaptor"]
-    T --> X["adaptor.execute(...) → acts on its one protocol"]
-    X --> P1{"vault did not over-spend?"}
-    P1 -- no --> R3["revert (OverSpend)"]
-    P1 -- yes --> P2{"adaptor kept nothing?"}
-    P2 -- no --> R4["revert (AdaptorRetainedFunds)"]
-    P2 -- yes --> P3{"declared result credited to vault (≥ minOut)?"}
-    P3 -- no --> R5["revert (ResultNotCredited)"]
-    P3 -- yes --> OK["settle ✓ — funds + results in the vault"]
+```
+                         ┌─────────────────────────────────────────────┐
+  SURFACES               │  Web chat (AgentChat)   Telegram bot + /tg   │
+                         └───────────────┬─────────────────────────────┘
+                                         │  natural language
+                         ┌───────────────▼─────────────────────────────┐
+  BRAIN                  │  runAgentTurn · system prompts · tools       │
+                         └───────────────┬─────────────────────────────┘
+                                         │  typed action envelope
+                         ┌───────────────▼─────────────────────────────┐
+  MONEY-PATH FIREWALL    │  recipient provenance · intent weld ·        │
+                         │  preflight · receiver guard · failure guard  │
+                         └───────────────┬─────────────────────────────┘
+                                         │  bounded, verified action
+                         ┌───────────────▼─────────────────────────────┐
+  EXECUTION              │  SupVault.execute / executeBatch on Arbitrum │
+                         │  Particle UA funding / payout                │
+                         └───────────────┬─────────────────────────────┘
+                                         │
+  STATE                  │  grants · allowances · vaults · listings ·   │
+                         │  activity · strategy · optional memory       │
 ```
 
-The post‑conditions (`OverSpend`, `AdaptorRetainedFunds`, `ResultNotCredited`) are the heart of the model: after the adaptor runs, the vault re‑checks the world and reverts the whole transaction unless the adaptor kept nothing and the result landed home. This is the EVM analog of a Move “hot‑potato” — results are *forced* back to the vault, in‑transaction. `call`, never `delegatecall`; a pure outflow (e.g. a payment) declares “no result asset” so the check adapts.
+### Key modules and contracts
+
+- **Vault contracts**: `SupVaultFactory`, `SupVault`, `AdaptorRegistry`, `AdaptorListingRegistry`,
+  `IAdaptor`, `PayAdaptor`, `UniswapV3SwapAdaptor`.
+- **Vault UI**: deposit/withdraw supports USDC, WETH, and native ETH. ETH deposits wrap to WETH; WETH
+  withdrawals can unwrap to native ETH.
+- **Particle UA**: `createTransferTransaction` handles cross-chain transfer with
+  `destinationChainId`; `createUniversalTransaction` handles arbitrary cross-chain contract calls.
+- **Marketplace**: open listing registry stores discovery metadata only. Curated execution registry is
+  the onchain gate that `SupVault` checks.
+- **AI authoring**: `/api/adaptors/author` drafts Solidity `IAdaptor` contracts bound to vault
+  invariants. Drafting or publishing does not grant execution rights.
+
+Optional, off by default:
+- Walrus manifest storage behind `SUP_WALRUS_ENABLED`; manifests currently live in KV.
+- Walrus Memory / MemWal behind `SUP_MEMORY_ENABLED`; the default provider is `NullProvider`.
 
 ---
 
-## Flows
+## 4. SupVault execution invariants
 
-### 0 · Onboarding & funding
+### `execute(...)`
 
-```mermaid
-sequenceDiagram
-    actor U as User
-    participant P as Privy
-    participant PA as Particle UA SDK
-    participant X as Any source chain
-    U->>P: Social login (email / Google)
-    P-->>U: Embedded wallet (EOA)
-    U->>PA: Sign EIP-7702 authorization (once)
-    PA-->>U: EOA is now a Universal Account (same address)
-    U->>PA: "Add 20 USDC"
-    PA->>X: Universal Account transfer (sources liquidity cross-chain)
-    X-->>U: USDC settled on Arbitrum (same address)
-```
+`execute(adaptor, inputToken, amountIn, Expectation, callData)`:
 
-### 1 · Create a vault + authorize an adaptor (owner‑signed)
+1. Requires the adaptor to be curated in `AdaptorRegistry`.
+2. Requires the owner to have granted that adaptor for the input token.
+3. Debits the per-`(adaptor, token)` allowance: `perTxCap`, `periodCap` rolling window, and `expiry`.
+4. Transfers **exactly** `amountIn` to the adaptor.
+5. Calls the adaptor with normal `call`, never `delegatecall`.
+6. Verifies post-conditions: no over-spend, adaptor kept no residual input token, and the declared
+   result credited to the vault by at least `minOut`.
 
-```mermaid
-sequenceDiagram
-    actor U as User
-    participant F as SupVaultFactory
-    participant V as SupVault (yours)
-    U->>F: createVault(agent)  [1 sig]
-    F-->>V: deploy EIP-1167 clone (owner = you, agent = Sup)
-    U->>V: deposit(token, amount)  [approve + deposit]
-    U->>V: setAllowance(adaptor, token, perTxCap, periodCap, expiry)  [1 sig]
-```
+The blast radius of a malicious approved adaptor is one authorized `amountIn`, not the vault balance.
 
-### 2 · Agent acts — 0 user signatures, bounded on‑chain
+### `executeBatch(...)`
 
-```mermaid
-sequenceDiagram
-    participant Agent as Agent (backend)
-    participant V as SupVault
-    participant AD as Adaptor
-    participant PROT as Protocol
-    Agent->>V: execute(adaptor, inputToken, amountIn, expect, data)
-    V->>V: assert registry-approved + owner-granted + within caps
-    V->>AD: transfer EXACTLY amountIn, then call
-    AD->>PROT: act (swap / pay / …), recipient = vault
-    PROT-->>V: results credited to the vault
-    V->>V: assert no over-spend · adaptor kept nothing · result in vault
-    Note over V: any violation → whole tx reverts
-```
+`executeBatch(Call[])` is the EVM analogue of a Sui PTB: several adaptor calls run in one atomic
+transaction. Each step keeps the same checks as `execute`, and every step's outputs are forced back to
+the vault before the next step starts. That lets a later step consume an earlier step's output, while any
+mid-batch revert rolls back the whole batch.
 
-### 3 · Revoke (instant, on‑chain)
-
-```mermaid
-sequenceDiagram
-    actor U as User
-    participant V as SupVault
-    U->>V: revokeAllowance(adaptor, token)
-    V-->>U: adaptor can no longer be executed
-```
+Foundry coverage includes chained steps, mid-batch rollback, per-step allowance debit, and `onlyAgent`.
 
 ---
 
-## Trust boundaries
+## 5. Shipped adaptors
 
-```mermaid
-flowchart LR
-    subgraph bounded["Bounded by the vault contract"]
-        AG["Agent (vault.agent delegate)"]
-    end
-    subgraph vault["SupVault — owner-only withdraw"]
-        FUNDS["Your assets"]
-    end
-    AG -- "execute() only: approved adaptor · ≤ caps · results forced home" --> FUNDS
-    FUNDS -. "owner-only deposit / withdraw / grant / revoke" .-> AG
-```
+Only two EVM adaptors exist today:
 
-- **The agent is a delegate, not an owner.** It can only call `execute`; it cannot withdraw, change allowances, or approve new adaptors.
-- **Two registries, on purpose.** Publishing is permissionless (discovery); *executing* requires the curated registry’s approval **and** the owner’s grant. Open to list, gated to run.
-- **Blast radius = one authorized amount.** A compromised backend or malicious adaptor can lose at most one owner‑authorized `amountIn` through one owner‑approved, registry‑curated adaptor — never the rest of the vault.
-- **Enforced, not trusted.** Every guarantee above is a `require`/`assert` in the vault, checked in the same atomic transaction — not a backend promise.
+| Adaptor | Purpose | Result expectation |
+|---|---|---|
+| `PayAdaptor` | Pay a recipient from the vault | `AssetKind.NONE` |
+| `UniswapV3SwapAdaptor` | Swap through Uniswap V3 | Output token credited to vault, `minOut` enforced |
+
+Uniswap LP, lending, perps, and other protocol adaptors are planned marketplace additions,
+not shipped contracts.
 
 ---
 
-## Design decisions (how we got here)
+## 6. UX flows
 
-1. **Funded agent “card” (rejected).** A separate pre‑funded account — clean cap, but the user babysits balances and a new address on every chain. Poor fit for the Universal Accounts vision.
-2. **Scoped signer + TEE policy (explored).** The agent as a policy‑bound signer on the user’s own 7702 account, enforced in Privy’s enclave — gasless grant/revoke and great UX, but the fine limits are trusted to the enclave rather than to the chain.
-3. **On‑chain vault + allowlisted adaptors (shipped).** Assets sit in the user’s own SupVault; the agent acts only through curated, owner‑granted adaptors; the vault’s runtime post‑conditions force results home atomically. Trust‑minimized *and* autonomous — the contract keeps the agent bounded, so the backend never has to be trusted with custody.
+### A. Fund the vault
+
+1. User chooses USDC, WETH, or native ETH.
+2. Same-chain deposits transfer into the user's vault. Native ETH is wrapped to WETH on deposit.
+3. Cross-chain funding uses Particle UA to source funds from another chain and deliver value to
+   Arbitrum, then completes the vault deposit flow.
+
+### B. Agent executes through an adaptor
+
+1. Owner grants an adaptor/token allowance with per-tx cap, period cap, and expiry.
+2. Sup prepares an adaptor call from user intent.
+3. The vault executes it only if registry, owner grant, allowance, and post-conditions all pass.
+4. Results stay in the vault.
+
+### C. Withdraw
+
+Only the owner can withdraw. USDC/WETH withdrawals transfer from the vault; WETH can be unwrapped to
+native ETH on withdrawal.
+
+### D. Marketplace
+
+Anyone can publish adaptor discovery metadata to `AdaptorListingRegistry`. That is not executable
+permission. Execution requires curation into `AdaptorRegistry` plus an owner grant in the vault.
 
 ---
 
-## Standards & building blocks
+## 7. Particle UA cross-chain role
 
-- **EIP‑7702** — upgrade an EOA in place; same address gains smart‑account behavior (the funding ramp).
-- **EIP‑1167** — minimal‑proxy clones, so each user gets their own vault for ~50k gas.
-- **Particle Universal Accounts** — one address, one balance, cross‑chain execution & liquidity.
-- **Privy** — embedded wallets, authorization‑key signers, gas sponsorship.
-- **Arbitrum One** — settlement chain; **Foundry / Solidity 0.8.28** — the vault, adaptors, and registries.
+Particle UA remains important, but it is not the vault:
+
+- Same address / unified balance for the owner.
+- Cross-chain transfer via `createTransferTransaction(destinationChainId)`.
+- Arbitrary cross-chain contract call via `createUniversalTransaction`.
+- Used as the funding and payout ramp around the Arbitrum vault.
+
+Cross-chain work cannot give the same all-or-nothing invariant as an Arbitrum `executeBatch`, so the
+vault/adaptor safety model is intentionally single-chain.
 
 ---
 
-## Optional layers (feature‑flagged, off by default)
+## 8. Trust boundaries
 
-- **Walrus manifests.** Adaptor manifests can be pinned to **Walrus** decentralized storage; the on‑chain listing then points at a permanent, content‑addressed blob instead of any single server. Integrity is anchored by an on‑chain sha256 of the manifest.
-- **Walrus Memory (MemWal).** Optional encrypted, user‑owned agent memory — redaction‑first (only preferences/behaviour, never secrets or exact amounts), three independent gates, and byte‑for‑byte no‑op when disabled.
+- **Onchain enforced:** vault custody, owner-only deposit/withdraw, curated registry check, owner grant,
+  per-`(adaptor, token)` allowance, exact `amountIn`, no `delegatecall`, adaptor residual check, and
+  `minOut` result credit.
+- **Trusted but bounded:** curated adaptor code. A bad curated adaptor is still capped by one authorized
+  `amountIn` per call and cannot directly drain the rest of the vault.
+- **Discovery only:** marketplace listings and AI-authored drafts.
+- **Offchain convenience:** agent brain, indexing, KV manifests, optional Walrus / memory providers.
+- **Never trusted:** the LLM is never the source of custody authority.
 
-Both are provider‑abstracted and default‑off, so the core wallet behaves identically with them turned off.
+---
+
+## 9. Status
+
+- **Deployed on Arbitrum One:** factory, vault implementation, curated registry, listing registry,
+  `PayAdaptor`, `UniswapV3SwapAdaptor`.
+- **Built/tested:** `execute`, `executeBatch`, chained batch steps, mid-batch rollback, per-step
+  allowance, and `onlyAgent`.
+- **UI shipped:** vault deposit/withdraw for USDC/WETH/native ETH and Particle UA cross-chain funding.
+- **Planned:** Uniswap LP, lending/perps adaptors, expanded marketplace analytics and
+  review flows.
